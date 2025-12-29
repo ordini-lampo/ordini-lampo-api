@@ -20,15 +20,13 @@ export default {
     
     try {
       if (path === '/' || path === '/health') {
-        await sql.end();
-        return json({ status: 'ok', version: '2.0.1-admin-fix' }, corsHeaders);
+        return json({ status: 'ok', version: '2.1.0-hyperdrive' }, corsHeaders);
       }
 
       // ==================== CLIENT ENDPOINTS ====================
       const bundleMatch = path.match(/^\/poke\/([^\/]+)\/bundle$/);
       if (bundleMatch && method === 'GET') {
         const r = await sql`SELECT poke.get_public_bundle_by_slug(${bundleMatch[1]}) as bundle`;
-        await sql.end();
         if (!r[0]?.bundle) return json({ error: 'Not found' }, corsHeaders, 404);
         return json({ success: true, data: r[0].bundle }, corsHeaders);
       }
@@ -38,7 +36,7 @@ export default {
         const slug = slotsMatch[1];
         const date = url.searchParams.get('date') || todayISO();
         const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!rest[0]?.id) { await sql.end(); return json({ error: 'Not found' }, corsHeaders, 404); }
+        if (!rest[0]?.id) return json({ error: 'Not found' }, corsHeaders, 404);
         const rid = rest[0].id;
         const counts = await sql`
           SELECT scheduled_time::text as slot, COUNT(*)::int as cnt
@@ -52,7 +50,6 @@ export default {
           FROM app.blocked_slots
           WHERE restaurant_id = ${rid} AND slot_date = ${date}::date
         `;
-        await sql.end();
         const availability: any = {};
         const allSlots = ['11:30','12:00','12:30','13:00','13:30','14:00','18:30','19:00','19:30','20:00','20:30','21:00','21:30','22:00'];
         allSlots.forEach(slot => {
@@ -74,11 +71,10 @@ export default {
         const slug = orderMatch[1];
         const body = await request.json() as any;
         if (!body.customer_name || !body.customer_phone || !body.bowls) {
-          await sql.end();
           return json({ error: 'Missing required fields' }, corsHeaders, 400);
         }
         const rest = await sql`SELECT id, name, whatsapp_number FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!rest[0]?.id) { await sql.end(); return json({ error: 'Not found' }, corsHeaders, 404); }
+        if (!rest[0]?.id) return json({ error: 'Not found' }, corsHeaders, 404);
         const rid = rest[0].id;
         const rname = rest[0].name;
         const phone = rest[0].whatsapp_number?.replace(/\D/g, '') || '';
@@ -93,7 +89,6 @@ export default {
         const cnt = existing[0]?.cnt || 0;
         const limit = PEAK_SLOTS.includes(slotKey) ? SLOT_LIMITS.peak : SLOT_LIMITS.normal;
         if (cnt >= limit) {
-          await sql.end();
           return json({ error: 'Slot full', message: `Slot ${slotKey} pieno (${limit} ordini max)` }, corsHeaders, 400);
         }
         const result = await sql`
@@ -104,7 +99,6 @@ export default {
             ${body.discount_code || null}
           ) as result
         `;
-        await sql.end();
         const order = result[0]?.result;
         if (!order?.success) return json({ error: order?.error || 'Failed' }, corsHeaders, 400);
         const msg = buildMessage(body, order, rname);
@@ -123,18 +117,17 @@ export default {
         const slug = adminOrdersMatch[1];
         const date = url.searchParams.get('date') || todayISO();
         const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!rest[0]?.id) { await sql.end(); return json({ error: 'Restaurant not found' }, corsHeaders, 404); }
+        if (!rest[0]?.id) return json({ error: 'Restaurant not found' }, corsHeaders, 404);
         const rid = rest[0].id;
         const orders = await sql`
           SELECT id, order_number, customer_name, customer_phone,
             delivery_address, scheduled_time, status, notes,
             subtotal, delivery_fee, discount_amount, total,
-            bowls, created_at, updated_at, location_id
+            created_at, updated_at, location_id
           FROM app.orders
           WHERE restaurant_id = ${rid} AND DATE(created_at) = ${date}::date
           ORDER BY created_at DESC
         `;
-        await sql.end();
         return json({ success: true, date, orders }, corsHeaders);
       }
 
@@ -144,11 +137,9 @@ export default {
         const body = await request.json() as any;
         const validStatuses = ['PENDING', 'CONFIRMED', 'PREPARING', 'READY', 'DELIVERING', 'DELIVERED', 'CANCELLED', 'REJECTED'];
         if (!validStatuses.includes(body.status)) {
-          await sql.end();
           return json({ error: 'Invalid status' }, corsHeaders, 400);
         }
         await sql`UPDATE app.orders SET status = ${body.status}, updated_at = NOW() WHERE id = ${orderId}::uuid`;
-        await sql.end();
         return json({ success: true, status: body.status }, corsHeaders);
       }
 
@@ -156,9 +147,8 @@ export default {
       if (adminSettingsMatch && method === 'GET') {
         const slug = adminSettingsMatch[1];
         const r = await sql`SELECT id, name, slug, whatsapp_number, settings FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!r[0]) { await sql.end(); return json({ error: 'Not found' }, corsHeaders, 404); }
+        if (!r[0]) return json({ error: 'Not found' }, corsHeaders, 404);
         const locations = await sql`SELECT id, name, delivery_fee, delivery_time_minutes, is_active FROM app.locations WHERE restaurant_id = ${r[0].id} ORDER BY sort_order`;
-        await sql.end();
         return json({ success: true, restaurant: r[0], locations }, corsHeaders);
       }
 
@@ -166,7 +156,6 @@ export default {
         const slug = adminSettingsMatch[1];
         const body = await request.json() as any;
         await sql`UPDATE app.restaurants SET name = COALESCE(${body.name || null}, name), whatsapp_number = COALESCE(${body.whatsapp_number || null}, whatsapp_number), settings = COALESCE(${body.settings ? JSON.stringify(body.settings) : null}::jsonb, settings), updated_at = NOW() WHERE slug = ${slug}`;
-        await sql.end();
         return json({ success: true }, corsHeaders);
       }
 
@@ -174,9 +163,8 @@ export default {
       if (blockedSlotsMatch && method === 'GET') {
         const slug = blockedSlotsMatch[1];
         const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!rest[0]?.id) { await sql.end(); return json({ error: 'Not found' }, corsHeaders, 404); }
+        if (!rest[0]?.id) return json({ error: 'Not found' }, corsHeaders, 404);
         const slots = await sql`SELECT id, slot_date, slot_time, reason FROM app.blocked_slots WHERE restaurant_id = ${rest[0].id} AND slot_date >= CURRENT_DATE ORDER BY slot_date, slot_time`;
-        await sql.end();
         return json({ success: true, blocked_slots: slots }, corsHeaders);
       }
 
@@ -184,23 +172,19 @@ export default {
         const slug = blockedSlotsMatch[1];
         const body = await request.json() as any;
         const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-        if (!rest[0]?.id) { await sql.end(); return json({ error: 'Not found' }, corsHeaders, 404); }
+        if (!rest[0]?.id) return json({ error: 'Not found' }, corsHeaders, 404);
         await sql`INSERT INTO app.blocked_slots (restaurant_id, slot_date, slot_time, reason) VALUES (${rest[0].id}, ${body.slot_date}::date, ${body.slot_time}::time, ${body.reason || 'Pieno'})`;
-        await sql.end();
         return json({ success: true }, corsHeaders);
       }
 
       const unblockSlotMatch = path.match(/^\/admin\/([^\/]+)\/blocked-slots\/([^\/]+)$/);
       if (unblockSlotMatch && method === 'DELETE') {
         await sql`DELETE FROM app.blocked_slots WHERE id = ${unblockSlotMatch[2]}::uuid`;
-        await sql.end();
         return json({ success: true }, corsHeaders);
       }
 
-      await sql.end();
       return json({ error: 'Not Found', path }, corsHeaders, 404);
     } catch (e: any) {
-      try { await sql.end(); } catch {}
       return json({ error: e.message }, corsHeaders, 500);
     }
   }
