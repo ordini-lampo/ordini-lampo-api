@@ -10,18 +10,15 @@ export default {
     const method = request.method;
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Content-Type': 'application/json'
     };
     if (method === 'OPTIONS') return new Response(null, { headers: corsHeaders });
     try {
-      // Health check
       if (path === '/' || path === '/health') {
-        return json({ status: 'ok', version: '2.0.0-admin' }, corsHeaders);
+        return json({ status: 'ok', version: '1.2.1-slots-fix' }, corsHeaders);
       }
-
-      // ==================== CLIENT ENDPOINTS ====================
       const bundleMatch = path.match(/^\/poke\/([^\/]+)\/bundle$/);
       if (bundleMatch && method === 'GET') {
         return await getBundle(env, bundleMatch[1], corsHeaders);
@@ -36,52 +33,6 @@ export default {
         const body = await request.json();
         return await createOrder(env, orderMatch[1], body, corsHeaders);
       }
-
-      // ==================== ADMIN ENDPOINTS ====================
-      // GET /admin/:slug/orders - Lista ordini
-      const adminOrdersMatch = path.match(/^\/admin\/([^\/]+)\/orders$/);
-      if (adminOrdersMatch && method === 'GET') {
-        const date = url.searchParams.get('date') || todayISO();
-        return await getAdminOrders(env, adminOrdersMatch[1], date, corsHeaders);
-      }
-
-      // PUT /admin/:slug/orders/:id - Aggiorna stato ordine
-      const adminOrderUpdateMatch = path.match(/^\/admin\/([^\/]+)\/orders\/([^\/]+)$/);
-      if (adminOrderUpdateMatch && method === 'PUT') {
-        const body = await request.json();
-        return await updateOrderStatus(env, adminOrderUpdateMatch[2], body.status, corsHeaders);
-      }
-
-      // GET /admin/:slug/settings - Impostazioni ristorante
-      const adminSettingsMatch = path.match(/^\/admin\/([^\/]+)\/settings$/);
-      if (adminSettingsMatch && method === 'GET') {
-        return await getAdminSettings(env, adminSettingsMatch[1], corsHeaders);
-      }
-
-      // PUT /admin/:slug/settings - Salva impostazioni
-      if (adminSettingsMatch && method === 'PUT') {
-        const body = await request.json();
-        return await saveAdminSettings(env, adminSettingsMatch[1], body, corsHeaders);
-      }
-
-      // GET /admin/:slug/blocked-slots - Slot bloccati
-      const blockedSlotsMatch = path.match(/^\/admin\/([^\/]+)\/blocked-slots$/);
-      if (blockedSlotsMatch && method === 'GET') {
-        return await getBlockedSlots(env, blockedSlotsMatch[1], corsHeaders);
-      }
-
-      // POST /admin/:slug/blocked-slots - Blocca slot
-      if (blockedSlotsMatch && method === 'POST') {
-        const body = await request.json();
-        return await blockSlot(env, blockedSlotsMatch[1], body, corsHeaders);
-      }
-
-      // DELETE /admin/:slug/blocked-slots/:id - Sblocca slot
-      const unblockSlotMatch = path.match(/^\/admin\/([^\/]+)\/blocked-slots\/([^\/]+)$/);
-      if (unblockSlotMatch && method === 'DELETE') {
-        return await unblockSlot(env, unblockSlotMatch[2], corsHeaders);
-      }
-
       return json({ error: 'Not Found', path }, corsHeaders, 404);
     } catch (e: any) {
       return json({ error: e.message }, corsHeaders, 500);
@@ -89,7 +40,6 @@ export default {
   }
 } satisfies ExportedHandler<Env>;
 
-// ==================== CLIENT FUNCTIONS ====================
 async function getBundle(env: Env, slug: string, h: any) {
   const sql = postgres(env.HYPERDRIVE.connectionString);
   try {
@@ -133,7 +83,6 @@ async function getSlots(env: Env, slug: string, date: string, h: any) {
     return json({ success: true, date, availability }, h);
   } finally { await sql.end(); }
 }
-
 async function createOrder(env: Env, slug: string, body: any, h: any) {
   const sql = postgres(env.HYPERDRIVE.connectionString);
   try {
@@ -179,116 +128,6 @@ async function createOrder(env: Env, slug: string, body: any, h: any) {
   } finally { await sql.end(); }
 }
 
-// ==================== ADMIN FUNCTIONS ====================
-async function getAdminOrders(env: Env, slug: string, date: string, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    const orders = await sql`
-      SELECT 
-        o.id, o.order_number, o.customer_name, o.customer_phone,
-        o.delivery_address, o.scheduled_time, o.status, o.notes,
-        o.subtotal, o.delivery_fee, o.discount_amount, o.total,
-        o.bowls, o.created_at, o.updated_at,
-        l.name as location_name
-      FROM app.orders o
-      JOIN app.restaurants r ON o.restaurant_id = r.id
-      LEFT JOIN app.locations l ON o.location_id = l.id
-      WHERE r.slug = ${slug} 
-        AND DATE(o.created_at) = ${date}::date
-      ORDER BY o.created_at DESC
-    `;
-    return json({ success: true, date, orders }, h);
-  } finally { await sql.end(); }
-}
-
-async function updateOrderStatus(env: Env, orderId: string, status: string, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    const validStatuses = ['PENDING', 'CONFIRMED', 'PREPARING', 'READY', 'DELIVERING', 'DELIVERED', 'CANCELLED', 'REJECTED'];
-    if (!validStatuses.includes(status)) {
-      return json({ error: 'Invalid status' }, h, 400);
-    }
-    await sql`
-      UPDATE app.orders 
-      SET status = ${status}, updated_at = NOW()
-      WHERE id = ${orderId}::uuid
-    `;
-    return json({ success: true, status }, h);
-  } finally { await sql.end(); }
-}
-
-async function getAdminSettings(env: Env, slug: string, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    const r = await sql`
-      SELECT id, name, slug, whatsapp_number, settings
-      FROM app.restaurants 
-      WHERE slug = ${slug} 
-      LIMIT 1
-    `;
-    if (!r[0]) return json({ error: 'Not found' }, h, 404);
-    const locations = await sql`
-      SELECT id, name, delivery_fee, delivery_time_minutes, is_active
-      FROM app.locations
-      WHERE restaurant_id = ${r[0].id}
-      ORDER BY sort_order
-    `;
-    return json({ success: true, restaurant: r[0], locations }, h);
-  } finally { await sql.end(); }
-}
-
-async function saveAdminSettings(env: Env, slug: string, body: any, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    await sql`
-      UPDATE app.restaurants 
-      SET 
-        name = COALESCE(${body.name}, name),
-        whatsapp_number = COALESCE(${body.whatsapp_number}, whatsapp_number),
-        settings = COALESCE(${JSON.stringify(body.settings)}::jsonb, settings),
-        updated_at = NOW()
-      WHERE slug = ${slug}
-    `;
-    return json({ success: true }, h);
-  } finally { await sql.end(); }
-}
-
-async function getBlockedSlots(env: Env, slug: string, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    const slots = await sql`
-      SELECT bs.id, bs.slot_date, bs.slot_time, bs.reason
-      FROM app.blocked_slots bs
-      JOIN app.restaurants r ON bs.restaurant_id = r.id
-      WHERE r.slug = ${slug} AND bs.slot_date >= CURRENT_DATE
-      ORDER BY bs.slot_date, bs.slot_time
-    `;
-    return json({ success: true, blocked_slots: slots }, h);
-  } finally { await sql.end(); }
-}
-
-async function blockSlot(env: Env, slug: string, body: any, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
-    if (!rest[0]?.id) return json({ error: 'Restaurant not found' }, h, 404);
-    await sql`
-      INSERT INTO app.blocked_slots (restaurant_id, slot_date, slot_time, reason)
-      VALUES (${rest[0].id}, ${body.slot_date}::date, ${body.slot_time}::time, ${body.reason || 'Pieno'})
-    `;
-    return json({ success: true }, h);
-  } finally { await sql.end(); }
-}
-
-async function unblockSlot(env: Env, slotId: string, h: any) {
-  const sql = postgres(env.HYPERDRIVE.connectionString);
-  try {
-    await sql`DELETE FROM app.blocked_slots WHERE id = ${slotId}::uuid`;
-    return json({ success: true }, h);
-  } finally { await sql.end(); }
-}
-
-// ==================== UTILITIES ====================
 function buildMessage(body: any, order: any, rname: string): string {
   const now = new Date();
   const d = now.toLocaleDateString('it-IT');
