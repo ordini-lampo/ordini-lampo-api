@@ -1,0 +1,897 @@
+/* ============================================================
+   Ordini-Lampo Worker - BULLDOZER ENTERPRISE v2.2 BILLING
+   ============================================================
+   CHANGELOG v2.2:
+   - ADD: POST /admin/billing/checkout - Crea Stripe Checkout
+   - ADD: POST /admin/billing/plans - Lista piani disponibili
+   - ADD: POST /webhooks/stripe - Webhook per accredito crediti
+   - FIX: sql.json() per JSONB (fix "cannot extract elements")
+   ============================================================ */
+
+import postgres from "postgres";
+import { createRemoteJWKSet, jwtVerify, JWTPayload } from "jose";
+
+type Hyperdrive = any;
+type Queue = any;
+
+interface Env {
+  HYPERDRIVE: Hyperdrive;
+  OUTBOX_QUEUE: Queue;
+  CLERK_JWKS_URL: string;
+  CLERK_ISSUER?: string;
+  CLERK_AUDIENCE?: string;
+  ALLOWED_ADMIN_ORIGINS?: string;
+  STRIPE_SECRET_KEY: string;
+  ENVIRONMENT?: "dev" | "prod";
+}
+
+// --------------------------
+// Business constants
+// --------------------------
+const SLOT_LIMITS = { normal: 8, peak: 5 };
+const PEAK_SLOTS = new Set(["12:00", "12:30", "19:30", "20:00"]);
+const ALL_SLOTS = [
+  "11:30","12:00","12:30","13:00","13:30","14:00",
+  "18:30","19:00","19:30","20:00","20:30","21:00","21:30","22:00"
+];
+
+// --------------------------
+// Security headers
+// --------------------------
+function securityHeaders(): Record<string, string> {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+  };
+}
+
+// --------------------------
+// CORS
+// --------------------------
+function parseAllowlist(env: Env): Set<string> {
+  const raw = env.ALLOWED_ADMIN_ORIGINS ?? "";
+  return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
+}
+
+function corsHeadersPublic(origin?: string | null) {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, If-Match, X-Request-Id, Stripe-Signature",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function corsHeadersAdmin(env: Env, origin?: string | null) {
+  const allow = parseAllowlist(env);
+  if (origin && origin !== "null" && allow.size > 0 && !allow.has(origin)) {
+    return { ok: false as const, headers: {} as Record<string, string> };
+  }
+  const allowOrigin = origin && origin !== "null" ? origin : "*";
+  return {
+    ok: true as const,
+    headers: {
+      "Access-Control-Allow-Origin": allowOrigin,
+      "Vary": "Origin",
+      "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, If-Match, X-Request-Id",
+      "Access-Control-Max-Age": "86400",
+    },
+  };
+}
+
+// --------------------------
+// Responses
+// --------------------------
+function json(data: any, status = 200, headers: Record<string, string> = {}) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...securityHeaders(), ...headers },
+  });
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// --------------------------
+// DB
+// --------------------------
+function db(env: Env) {
+  return postgres(env.HYPERDRIVE.connectionString, {
+    prepare: false,
+    idle_timeout: 30,
+    max_lifetime: 60 * 5,
+  });
+}
+
+async function setDbRequestContext(sql: any, ctx: {
+  userId: string;
+  tenantId: string;
+  role: string;
+  requestId: string;
+  ip: string;
+  ua: string;
+}) {
+  await sql`
+    SELECT
+      set_config('request.user_id', ${ctx.userId}, true),
+      set_config('request.tenant_id', ${ctx.tenantId}, true),
+      set_config('request.role', ${ctx.role}, true),
+      set_config('request.request_id', ${ctx.requestId}, true),
+      set_config('request.ip', ${ctx.ip}, true),
+      set_config('request.ua', ${ctx.ua}, true)
+  `;
+}
+
+// --------------------------
+// Clerk JWT verification
+// --------------------------
+let jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
+
+function getJwks(env: Env) {
+  if (!jwksCache) {
+    const url = new URL(env.CLERK_JWKS_URL);
+    jwksCache = createRemoteJWKSet(url);
+  }
+  return jwksCache;
+}
+
+function readBearer(request: Request): string | null {
+  const h = request.headers.get("authorization") || request.headers.get("Authorization");
+  if (!h) return null;
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+
+function isUuid(x: unknown): x is string {
+  if (typeof x !== "string") return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(x);
+}
+
+type AuthCtx = {
+  userId: string;
+  restaurantId: string;
+  tenantId: string;
+  role: string;
+  claims: JWTPayload;
+};
+
+function normalizeRole(claims: JWTPayload): string {
+  const direct = (claims.role as any) || (claims.org_role as any);
+  const meta = (claims.public_metadata as any)?.role;
+  const r = String(direct || meta || "staff");
+  return r.toLowerCase();
+}
+
+function isAdminRole(role: string): boolean {
+  return ["owner", "admin", "superadmin"].includes(role);
+}
+
+async function verifyClerkJWT(env: Env, token: string): Promise<AuthCtx> {
+  const jwks = getJwks(env);
+  const { payload } = await jwtVerify(token, jwks, {
+    issuer: env.CLERK_ISSUER || undefined,
+    audience: env.CLERK_AUDIENCE || undefined,
+  });
+
+  const userId = String(payload.sub || "");
+  if (!userId) throw new Error("UNAUTHENTICATED");
+
+  const restaurantId = (payload.restaurant_id as any) ?? (payload.public_metadata as any)?.restaurant_id;
+  if (!isUuid(restaurantId)) throw new Error("NO_TENANT_BOUND");
+
+  const tenantId = (payload.tenant_id as any) ?? (payload.public_metadata as any)?.tenant_id ?? restaurantId;
+  const role = normalizeRole(payload);
+
+  return { userId, restaurantId, tenantId, role, claims: payload };
+}
+
+// --------------------------
+// Helpers
+// --------------------------
+function getRequestId(req: Request): string {
+  const h = req.headers.get("x-request-id");
+  return h && h.length >= 16 ? h : crypto.randomUUID();
+}
+
+function getClientIp(req: Request): string {
+  return req.headers.get("cf-connecting-ip") || "";
+}
+
+function getUA(req: Request): string {
+  return req.headers.get("user-agent") || "";
+}
+
+// --------------------------
+// Stripe API Helper
+// --------------------------
+async function stripeRequest(env: Env, endpoint: string, method: string, body?: any) {
+  const url = `https://api.stripe.com/v1${endpoint}`;
+  const headers: Record<string, string> = {
+    "Authorization": `Bearer ${env.STRIPE_SECRET_KEY}`,
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+
+  const options: RequestInit = { method, headers };
+  
+  if (body) {
+    const params = new URLSearchParams();
+    flattenObject(body, params);
+    options.body = params.toString();
+  }
+
+  const res = await fetch(url, options);
+  return res.json();
+}
+
+function flattenObject(obj: any, params: URLSearchParams, prefix = "") {
+  for (const key of Object.keys(obj)) {
+    const value = obj[key];
+    const fullKey = prefix ? `${prefix}[${key}]` : key;
+    
+    if (value === null || value === undefined) continue;
+    
+    if (typeof value === "object" && !Array.isArray(value)) {
+      flattenObject(value, params, fullKey);
+    } else if (Array.isArray(value)) {
+      value.forEach((item, index) => {
+        if (typeof item === "object") {
+          flattenObject(item, params, `${fullKey}[${index}]`);
+        } else {
+          params.append(`${fullKey}[${index}]`, String(item));
+        }
+      });
+    } else {
+      params.append(fullKey, String(value));
+    }
+  }
+}
+
+// --------------------------
+// WhatsApp message builder
+// --------------------------
+function buildMessage(body: any, order: any, rname: string): string {
+  const now = new Date();
+  const d = now.toLocaleDateString("it-IT");
+  const t = now.toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+
+  let msg = `==================\nSEZIONE 1: DATI ORDINE\n==================\n`;
+  msg += `N. Ordine: #${order.order_number}\nData Ordine: ${d} ore ${t}\n`;
+  msg += `Ora Consegna: ${body.delivery_time || "12:00"}\n`;
+  msg += `==================\nSEZIONE 2: INGREDIENTI\n==================\n`;
+
+  if (body.bowls?.length) {
+    body.bowls.forEach((b: any, i: number) => {
+      msg += `BOWL #${i + 1} (${b.bowl_type_name || "Regular"})\n------------------\n`;
+      ["base", "proteine", "verdure", "salse", "toppings"].forEach((cat) => {
+        if (b[cat]?.length) {
+          msg += `${String(cat).toUpperCase()}:\n`;
+          b[cat].forEach((x: any) => {
+            msg += ` - ${x.name}${x.qty > 1 ? " x" + x.qty : ""}\n`;
+          });
+        }
+      });
+    });
+  }
+
+  if (body.allergie) msg += `ALLERGIE: ${body.allergie}\n`;
+  if (body.posate_richieste) msg += `Posate Richieste: Si\n`;
+
+  msg += `==================\nSEZIONE 3: CLIENTE\n==================\n`;
+  msg += `Nome: ${body.customer_name}\nTelefono: ${body.customer_phone}\n`;
+  msg += `Indirizzo: ${body.delivery_address || "Ritiro"}\n`;
+  if (body.citofono) msg += `Citofono: ${body.citofono}\n`;
+  msg += `Pagamento: ${body.payment_method || "Contanti"}\n`;
+
+  msg += `==================\nSEZIONE 4: RIEPILOGO\n==================\n`;
+  msg += `Subtotale: EUR ${Number(order.subtotal || 0).toFixed(2)}\n`;
+  if (Number(order.delivery_fee || 0) > 0) msg += `Consegna: EUR ${Number(order.delivery_fee || 0).toFixed(2)}\n`;
+  if (Number(order.discount_amount || 0) > 0) msg += `Sconto: -EUR ${Number(order.discount_amount || 0).toFixed(2)}\n`;
+  msg += `TOTALE: EUR ${Number(order.total || 0).toFixed(2)}\n`;
+  msg += `Grazie per aver scelto ${rname}!\nPowered by Ordini-Lampo.it`;
+
+  return msg;
+}
+
+// --------------------------
+// Main handler
+// --------------------------
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method.toUpperCase();
+
+    const origin = request.headers.get("origin");
+    const isAdminRoute = path.startsWith("/admin");
+    const isWebhook = path.startsWith("/webhooks");
+
+    // CORS (OPTIONS)
+    if (method === "OPTIONS") {
+      if (isAdminRoute) {
+        const c = corsHeadersAdmin(env, origin);
+        if (!c.ok) return json({ success: false, error: "CORS_DENIED" }, 403, {});
+        return new Response(null, { status: 204, headers: { ...c.headers, ...securityHeaders() } });
+      }
+      return new Response(null, { status: 204, headers: { ...corsHeadersPublic(origin), ...securityHeaders() } });
+    }
+
+    const cors = isAdminRoute
+      ? (() => { const c = corsHeadersAdmin(env, origin); return c.ok ? c.headers : null; })()
+      : corsHeadersPublic(origin);
+
+    if (!cors && !isWebhook) return json({ success: false, error: "CORS_DENIED" }, 403, {});
+
+    const sql = db(env);
+
+    try {
+      // --------------------------
+      // Health
+      // --------------------------
+      if (path === "/" || path === "/health") {
+        return json({ status: "ok", version: "BULLDOZER-2.2-BILLING" }, 200, cors || {});
+      }
+
+      // ============================================================
+      // STRIPE WEBHOOK (no auth, verificato via signature)
+      // ============================================================
+      if (path === "/webhooks/stripe" && method === "POST") {
+        const body = await request.text();
+        let event: any;
+        
+        try {
+          event = JSON.parse(body);
+        } catch {
+          return json({ error: "Invalid JSON" }, 400, corsHeadersPublic());
+        }
+
+        console.log(`Stripe webhook: ${event.type}`, event.id);
+
+        // Handle checkout.session.completed
+        if (event.type === "checkout.session.completed") {
+          const session = event.data.object;
+          const metadata = session.metadata || {};
+          
+          const planCode = metadata.plan_code;
+          const restaurantId = metadata.restaurant_id;
+          const tenantId = metadata.tenant_id;
+          
+          if (!planCode || !restaurantId) {
+            console.error("Missing metadata in checkout session", metadata);
+            return json({ received: true, warning: "missing_metadata" }, 200, corsHeadersPublic());
+          }
+
+          // Get plan details
+          const [plan] = await sql`
+            SELECT * FROM billing.plans WHERE code = ${planCode}
+          `;
+
+          if (!plan) {
+            console.error("Plan not found:", planCode);
+            return json({ received: true, error: "plan_not_found" }, 200, corsHeadersPublic());
+          }
+
+          const totalCredits = plan.credits_included + plan.bonus_credits;
+
+          // Find or create subscription
+          let [subscription] = await sql`
+            SELECT * FROM billing.subscriptions 
+            WHERE restaurant_id = ${restaurantId}::uuid
+            LIMIT 1
+          `;
+
+          if (!subscription) {
+            // Create new subscription
+            const [newSub] = await sql`
+              INSERT INTO billing.subscriptions (
+                tenant_id, restaurant_id, plan_code, status,
+                credits_balance, bonus_balance, stripe_customer_id
+              ) VALUES (
+                ${tenantId || restaurantId}::uuid,
+                ${restaurantId}::uuid,
+                ${planCode},
+                'active',
+                ${plan.credits_included},
+                ${plan.bonus_credits},
+                ${session.customer}
+              )
+              RETURNING *
+            `;
+            subscription = newSub;
+          } else {
+            // Update existing subscription
+            await sql`
+              UPDATE billing.subscriptions SET
+                plan_code = ${planCode},
+                status = 'active',
+                credits_balance = credits_balance + ${plan.credits_included},
+                bonus_balance = bonus_balance + ${plan.bonus_credits},
+                stripe_customer_id = COALESCE(stripe_customer_id, ${session.customer}),
+                updated_at = now()
+              WHERE id = ${subscription.id}
+            `;
+          }
+
+          // Record credit transaction - PAID credits
+          await sql`
+            INSERT INTO billing.credit_transactions (
+              subscription_id, tenant_id, type, amount, balance_after, is_bonus,
+              reference_type, reference_id, description
+            ) VALUES (
+              ${subscription.id},
+              ${tenantId || restaurantId}::uuid,
+              'purchase',
+              ${plan.credits_included},
+              ${(subscription.credits_balance || 0) + plan.credits_included},
+              false,
+              'stripe_checkout',
+              ${session.id}::text::uuid,
+              ${`Acquisto ${plan.name} - ${plan.credits_included} crediti`}
+            )
+          `;
+
+          // Record credit transaction - BONUS credits
+          if (plan.bonus_credits > 0) {
+            await sql`
+              INSERT INTO billing.credit_transactions (
+                subscription_id, tenant_id, type, amount, balance_after, is_bonus,
+                reference_type, reference_id, description
+              ) VALUES (
+                ${subscription.id},
+                ${tenantId || restaurantId}::uuid,
+                'bonus',
+                ${plan.bonus_credits},
+                ${(subscription.bonus_balance || 0) + plan.bonus_credits},
+                true,
+                'stripe_checkout',
+                ${session.id}::text::uuid,
+                ${`Bonus ${plan.name} - ${plan.bonus_credits} crediti omaggio`}
+              )
+            `;
+          }
+
+          // Create invoice record
+          const invoiceNumber = `INV-${new Date().getFullYear()}-${Date.now()}`;
+          await sql`
+            INSERT INTO billing.invoices (
+              subscription_id, tenant_id, invoice_number, invoice_type,
+              amount_cents, status, stripe_payment_intent_id, paid_at
+            ) VALUES (
+              ${subscription.id},
+              ${tenantId || restaurantId}::uuid,
+              ${invoiceNumber},
+              'package',
+              ${session.amount_total},
+              'paid',
+              ${session.payment_intent},
+              now()
+            )
+          `;
+
+          console.log(`Credits granted: ${totalCredits} to restaurant ${restaurantId}`);
+          return json({ received: true, credits_granted: totalCredits }, 200, corsHeadersPublic());
+        }
+
+        // Other webhook types - acknowledge but don't process
+        return json({ received: true }, 200, corsHeadersPublic());
+      }
+
+      // ============================================================
+      // PUBLIC ENDPOINTS
+      // ============================================================
+      
+      // GET /poke/:slug/bundle
+      const bundleMatch = path.match(/^\/poke\/([^\/]+)\/bundle$/);
+      if (bundleMatch && method === "GET") {
+        const slug = bundleMatch[1];
+        const r = await sql`SELECT poke.get_public_bundle_by_slug(${slug}) as bundle`;
+        if (!r?.[0]?.bundle) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+        return json({ success: true, data: r[0].bundle }, 200, cors!);
+      }
+
+      // GET /public/restaurant/:slug/bundle
+      const publicBundleMatch = path.match(/^\/public\/restaurant\/([^\/]+)\/bundle$/);
+      if (publicBundleMatch && method === "GET") {
+        const slug = publicBundleMatch[1];
+        const r = await sql`SELECT poke.get_public_bundle_by_slug(${slug}) as bundle`;
+        if (!r?.[0]?.bundle) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+        return json({ success: true, data: r[0].bundle }, 200, cors!);
+      }
+
+      // GET /poke/:slug/slots
+      const slotsMatch = path.match(/^\/poke\/([^\/]+)\/slots$/);
+      if (slotsMatch && method === "GET") {
+        const slug = slotsMatch[1];
+        const date = url.searchParams.get("date") || todayISO();
+
+        const rest = await sql`SELECT id FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
+        if (!rest?.[0]?.id) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+        const rid = rest[0].id;
+
+        const counts = await sql`
+          SELECT to_char(scheduled_time, 'HH24:MI') as slot, COUNT(*)::int as cnt
+          FROM app.orders WHERE restaurant_id = ${rid} AND DATE(created_at) = ${date}::date
+            AND status NOT IN ('CANCELLED', 'REJECTED') GROUP BY 1
+        `;
+        const blocked = await sql`
+          SELECT to_char(slot_time, 'HH24:MI') as slot, reason
+          FROM app.blocked_slots WHERE restaurant_id = ${rid} AND slot_date = ${date}::date
+        `;
+
+        const availability: Record<string, any> = {};
+        for (const slot of ALL_SLOTS) {
+          const found = counts.find((c: any) => c.slot === slot);
+          const block = blocked.find((b: any) => b.slot === slot);
+          const count = found?.cnt ?? 0;
+          const limit = PEAK_SLOTS.has(slot) ? SLOT_LIMITS.peak : SLOT_LIMITS.normal;
+          availability[slot] = block
+            ? { count, limit, available: false, blocked: true, reason: block.reason }
+            : { count, limit, available: count < limit };
+        }
+
+        return json({ success: true, date, availability }, 200, cors!);
+      }
+
+      // POST /poke/:slug/order
+      const orderMatch = path.match(/^\/poke\/([^\/]+)\/order$/);
+      if (orderMatch && method === "POST") {
+        const slug = orderMatch[1];
+        const body = await request.json().catch(() => null);
+
+        if (!body || !body.customer_name || !body.customer_phone || !Array.isArray(body.bowls)) {
+          return json({ success: false, error: "MISSING_FIELDS" }, 400, cors!);
+        }
+
+        const rest = await sql`SELECT id, name, whatsapp_number FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
+        if (!rest?.[0]?.id) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+
+        const rid = rest[0].id;
+        const rname = rest[0].name;
+        const phone = String(rest[0].whatsapp_number || "").replace(/\D/g, "");
+        const time = body.delivery_time || "12:00";
+        const slotKey = String(time).substring(0, 5);
+
+        const existing = await sql`
+          SELECT COUNT(*)::int as cnt FROM app.orders
+          WHERE restaurant_id = ${rid} AND DATE(created_at) = CURRENT_DATE
+            AND to_char(scheduled_time, 'HH24:MI') = ${slotKey}
+            AND status NOT IN ('CANCELLED', 'REJECTED')
+        `;
+
+        const cnt = existing?.[0]?.cnt ?? 0;
+        const limit = PEAK_SLOTS.has(slotKey) ? SLOT_LIMITS.peak : SLOT_LIMITS.normal;
+
+        if (cnt >= limit) {
+          return json({ success: false, error: "SLOT_FULL", message: `Slot ${slotKey} pieno` }, 400, cors!);
+        }
+
+        // FIX: usa sql.json() per JSONB
+        const result = await sql`
+          SELECT poke.create_order(
+            ${rid}::uuid, ${body.customer_name}, ${body.customer_phone},
+            ${body.location_id || null}::uuid, ${body.delivery_address || ''}, ${time},
+            ${body.notes || ''}, ${sql.json(body.bowls)}, ${body.discount_code || null}
+          ) as result
+        `;
+
+        const order = result?.[0]?.result;
+        if (!order?.success) return json({ success: false, error: order?.error || "CREATE_FAILED" }, 400, cors!);
+
+        const msg = buildMessage(body, order, rname);
+        const deeplink = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+
+        return json({
+          success: true,
+          order_id: order.order_id,
+          order_number: order.order_number,
+          subtotal: order.subtotal,
+          delivery_fee: order.delivery_fee,
+          discount_amount: order.discount_amount,
+          total: order.total,
+          whatsapp: { to: phone, text: msg, deeplink },
+        }, 200, cors!);
+      }
+
+      // POST /public/orders (alias)
+      if (path === "/public/orders" && method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body?.customer_name || !body?.customer_phone) {
+          return json({ success: false, error: "MISSING_FIELDS" }, 400, cors!);
+        }
+
+        const slug = body.restaurant_slug || body.slug;
+        if (!slug) return json({ success: false, error: "MISSING_RESTAURANT_SLUG" }, 400, cors!);
+
+        const rest = await sql`SELECT id, name, whatsapp_number FROM app.restaurants WHERE slug = ${slug} LIMIT 1`;
+        if (!rest?.[0]?.id) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+
+        const rid = rest[0].id;
+        const rname = rest[0].name;
+        const phone = String(rest[0].whatsapp_number || "").replace(/\D/g, "");
+        const time = body.delivery_time || "12:00";
+        const bowls = Array.isArray(body.bowls) ? body.bowls : [];
+
+        const result = await sql`
+          SELECT poke.create_order(
+            ${rid}::uuid, ${body.customer_name}, ${body.customer_phone},
+            ${body.location_id || null}::uuid, ${body.delivery_address || ''}, ${time},
+            ${body.notes || ''}, ${sql.json(bowls)}, ${body.discount_code || null}
+          ) as result
+        `;
+
+        const order = result?.[0]?.result;
+        if (!order?.success) return json({ success: false, error: order?.error || "CREATE_FAILED" }, 400, cors!);
+
+        const msg = buildMessage(body, order, rname);
+        const deeplink = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+
+        return json({
+          success: true,
+          order_id: order.order_id,
+          order_number: order.order_number,
+          subtotal: order.subtotal,
+          delivery_fee: order.delivery_fee,
+          discount_amount: order.discount_amount,
+          total: order.total,
+          whatsapp: { to: phone, text: msg, deeplink },
+        }, 200, cors!);
+      }
+
+      // ============================================================
+      // ADMIN ENDPOINTS (AUTH REQUIRED)
+      // ============================================================
+      if (path.startsWith("/admin")) {
+        const token = readBearer(request);
+        if (!token) return json({ success: false, error: "UNAUTHENTICATED" }, 401, cors!);
+
+        let auth: AuthCtx;
+        try {
+          auth = await verifyClerkJWT(env, token);
+        } catch (e: any) {
+          return json({ success: false, error: String(e?.message || "UNAUTHENTICATED") }, 401, cors!);
+        }
+
+        if (!isAdminRole(auth.role)) {
+          return json({ success: false, error: "FORBIDDEN" }, 403, cors!);
+        }
+
+        const requestId = getRequestId(request);
+        const ip = getClientIp(request);
+        const ua = getUA(request);
+
+        // ============================================================
+        // BILLING ENDPOINTS
+        // ============================================================
+
+        // GET /admin/billing/plans - Lista piani disponibili
+        if (path === "/admin/billing/plans" && method === "GET") {
+          const plans = await sql`
+            SELECT code, name, description, type, price_per_credit, package_price,
+                   credits_included, bonus_credits, stripe_price_id, stripe_coupon_id
+            FROM billing.plans
+            WHERE is_active = true
+            ORDER BY sort_order
+          `;
+          return json({ success: true, plans }, 200, cors!);
+        }
+
+        // GET /admin/billing/subscription - Stato abbonamento corrente
+        if (path === "/admin/billing/subscription" && method === "GET") {
+          const [subscription] = await sql`
+            SELECT s.*, p.name as plan_name, p.price_per_credit,
+                   (s.credits_balance + s.bonus_balance) as total_credits
+            FROM billing.subscriptions s
+            JOIN billing.plans p ON p.code = s.plan_code
+            WHERE s.restaurant_id = ${auth.restaurantId}::uuid
+            LIMIT 1
+          `;
+
+          if (!subscription) {
+            return json({ 
+              success: true, 
+              subscription: null,
+              message: "No active subscription" 
+            }, 200, cors!);
+          }
+
+          return json({ success: true, subscription }, 200, cors!);
+        }
+
+        // POST /admin/billing/checkout - Crea Stripe Checkout Session
+        if (path === "/admin/billing/checkout" && method === "POST") {
+          const body = await request.json().catch(() => null);
+          const planCode = body?.plan_code;
+
+          if (!planCode) {
+            return json({ success: false, error: "MISSING_PLAN_CODE" }, 400, cors!);
+          }
+
+          // Get plan from DB
+          const [plan] = await sql`
+            SELECT * FROM billing.plans 
+            WHERE code = ${planCode} AND is_active = true
+          `;
+
+          if (!plan) {
+            return json({ success: false, error: "PLAN_NOT_FOUND" }, 404, cors!);
+          }
+
+          if (!plan.stripe_price_id) {
+            return json({ success: false, error: "STRIPE_NOT_CONFIGURED" }, 500, cors!);
+          }
+
+          // Get restaurant info
+          const [restaurant] = await sql`
+            SELECT id, name, slug FROM app.restaurants 
+            WHERE id = ${auth.restaurantId}::uuid
+          `;
+
+          // Get or find existing Stripe customer
+          let [subscription] = await sql`
+            SELECT stripe_customer_id FROM billing.subscriptions
+            WHERE restaurant_id = ${auth.restaurantId}::uuid
+            LIMIT 1
+          `;
+
+          let stripeCustomerId = subscription?.stripe_customer_id;
+
+          // Create Stripe customer if needed
+          if (!stripeCustomerId) {
+            const customer = await stripeRequest(env, "/customers", "POST", {
+              name: restaurant.name,
+              metadata: {
+                restaurant_id: auth.restaurantId,
+                tenant_id: auth.tenantId,
+                slug: restaurant.slug
+              }
+            });
+            stripeCustomerId = customer.id;
+          }
+
+          // Build checkout session params
+          const checkoutParams: any = {
+            customer: stripeCustomerId,
+            mode: "payment",
+            success_url: `https://ordinlampo-admin.netlify.app/?checkout=success&plan=${planCode}`,
+            cancel_url: `https://ordinlampo-admin.netlify.app/?checkout=cancelled`,
+            "line_items[0][price]": plan.stripe_price_id,
+            "line_items[0][quantity]": "1",
+            "metadata[plan_code]": planCode,
+            "metadata[restaurant_id]": auth.restaurantId,
+            "metadata[tenant_id]": auth.tenantId,
+            "metadata[user_id]": auth.userId,
+          };
+
+          // Add coupon if exists
+          if (plan.stripe_coupon_id) {
+            checkoutParams["discounts[0][coupon]"] = plan.stripe_coupon_id;
+          }
+
+          // Create checkout session via Stripe API
+          const session = await stripeRequest(env, "/checkout/sessions", "POST", checkoutParams);
+
+          if (session.error) {
+            console.error("Stripe error:", session.error);
+            return json({ success: false, error: session.error.message }, 500, cors!);
+          }
+
+          return json({
+            success: true,
+            checkout_url: session.url,
+            session_id: session.id
+          }, 200, cors!);
+        }
+
+        // GET /admin/billing/history - Storico transazioni
+        if (path === "/admin/billing/history" && method === "GET") {
+          const [subscription] = await sql`
+            SELECT id FROM billing.subscriptions
+            WHERE restaurant_id = ${auth.restaurantId}::uuid
+          `;
+
+          if (!subscription) {
+            return json({ success: true, transactions: [], invoices: [] }, 200, cors!);
+          }
+
+          const transactions = await sql`
+            SELECT * FROM billing.credit_transactions
+            WHERE subscription_id = ${subscription.id}
+            ORDER BY created_at DESC
+            LIMIT 50
+          `;
+
+          const invoices = await sql`
+            SELECT * FROM billing.invoices
+            WHERE subscription_id = ${subscription.id}
+            ORDER BY created_at DESC
+            LIMIT 20
+          `;
+
+          return json({ success: true, transactions, invoices }, 200, cors!);
+        }
+
+        // ============================================================
+        // EXISTING ADMIN ENDPOINTS
+        // ============================================================
+
+        return await sql.begin(async (tx: any) => {
+          await setDbRequestContext(tx, {
+            userId: auth.userId,
+            tenantId: auth.restaurantId,
+            role: auth.role,
+            requestId,
+            ip,
+            ua,
+          });
+
+          // GET /admin/orders
+          if (path === "/admin/orders" && method === "GET") {
+            const date = url.searchParams.get("date") || todayISO();
+            const orders = await tx`
+              SELECT id, order_number, customer_name, customer_phone,
+                     delivery_address, scheduled_time, status, notes,
+                     subtotal, delivery_fee, discount_amount, total,
+                     created_at, updated_at, location_id
+              FROM app.orders
+              WHERE restaurant_id = ${auth.restaurantId}::uuid AND DATE(created_at) = ${date}::date
+              ORDER BY created_at DESC
+            `;
+            return json({ success: true, date, orders }, 200, cors!);
+          }
+
+          // PUT /admin/orders/:id
+          const upd = path.match(/^\/admin\/orders\/([^\/]+)$/);
+          if (upd && method === "PUT") {
+            const orderId = upd[1];
+            const body = await request.json().catch(() => null);
+            const status = String(body?.status || "");
+
+            const VALID = new Set(["PENDING","CONFIRMED","PREPARING","READY","DELIVERING","DELIVERED","CANCELLED","REJECTED"]);
+            if (!VALID.has(status)) return json({ success: false, error: "INVALID_STATUS" }, 400, cors!);
+
+            const before = await tx`
+              SELECT id, status FROM app.orders
+              WHERE id = ${orderId}::uuid AND restaurant_id = ${auth.restaurantId}::uuid LIMIT 1
+            `;
+            if (!before?.[0]?.id) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+
+            await tx`
+              UPDATE app.orders SET status = ${status}, updated_at = NOW()
+              WHERE id = ${orderId}::uuid AND restaurant_id = ${auth.restaurantId}::uuid
+            `;
+
+            return json({ success: true, status }, 200, cors!);
+          }
+
+          // GET /admin/settings
+          if (path === "/admin/settings" && method === "GET") {
+            const r = await tx`
+              SELECT id, name, slug, whatsapp_number FROM app.restaurants
+              WHERE id = ${auth.restaurantId}::uuid LIMIT 1
+            `;
+            if (!r?.[0]?.id) return json({ success: false, error: "NOT_FOUND" }, 404, cors!);
+
+            const locations = await tx`
+              SELECT id, name, delivery_fee, sort_order FROM app.locations
+              WHERE restaurant_id = ${auth.restaurantId}::uuid
+              ORDER BY sort_order NULLS LAST, name
+            `;
+
+            return json({ success: true, restaurant: r[0], locations }, 200, cors!);
+          }
+
+          return json({ success: false, error: "NOT_FOUND", path }, 404, cors!);
+        });
+      }
+
+      return json({ success: false, error: "NOT_FOUND", path }, 404, cors || {});
+    } catch (e: any) {
+      console.error("Worker error:", e);
+      return json({ success: false, error: String(e?.message || "SERVER_ERROR") }, 500, cors || {});
+    }
+  },
+} satisfies ExportedHandler<Env>;
