@@ -341,15 +341,22 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
       tenant = tenants[0] || null;
     }
 
-    const returnTo =
+    const rawReturnTo =
       (typeof req.body?.returnTo === 'string' && req.body.returnTo) ||
       (typeof req.query?.returnTo === 'string' && req.query.returnTo) ||
       null;
 
-    // Se arriva returnTo (dal form HTML), dopo aver settato i cookie facciamo redirect.
+    // Hardening: allow only internal admin paths
+    let returnTo = null;
+    if (rawReturnTo && rawReturnTo.startsWith('/admin')) {
+      returnTo = rawReturnTo;
+    }
+
+    // Se arriva returnTo valido, redirect sicuro
     if (returnTo) {
       return res.redirect(302, returnTo);
     }
+
 
     return res.json({
       success: true,
