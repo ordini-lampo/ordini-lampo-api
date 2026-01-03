@@ -217,6 +217,14 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     const { email, password } = body;
     const ip = getIp(req);
     const ua = getUA(req);
+    console.log("[LOGIN] start", {
+      email_raw: email,
+      email_norm: String(email || "").toLowerCase(),
+      has_password: Boolean(password),
+      ip,
+      ua,
+});
+
 
     // Find user
     const users = await query(
@@ -226,10 +234,16 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
        WHERE email = $1`,
       [email.toLowerCase()]
     );
+    console.log("[LOGIN] user_lookup", {
+      found: users.length > 0,
+      count: users.length,
+    });
+
 
     if (users.length === 0) {
       // Timing-safe: hash anyway to prevent timing attacks
       await bcrypt.hash(password, BCRYPT_COST);
+      console.log("[LOGIN] early_401_reason", "USER_NOT_FOUND");
       return res.status(401).json({
         error: 'INVALID_CREDENTIALS',
         message: 'Email o password non validi',
@@ -237,6 +251,14 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     }
 
     const user = users[0];
+      console.log("[LOGIN] user_state", {
+      user_id: user.id,
+      failed_login_attempts: user.failed_login_attempts,
+      locked_until: user.locked_until,
+      global_role: user.global_role,
+      has_password_hash: Boolean(user.password_hash),
+      password_hash_prefix: String(user.password_hash || "").slice(0, 4),    });
+
 
     // Check lockout
     if (user.locked_until && new Date(user.locked_until) > new Date()) {
