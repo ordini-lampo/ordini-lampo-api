@@ -156,6 +156,60 @@ router.post('/register', rateLimiter.auth, async (req, res) => {
 // ============================================================
 // POST /auth/login
 // ============================================================
+// ============================================================
+// GET /auth/login  (HTML minimal form)
+// ============================================================
+router.get('/login', (req, res) => {
+  const returnTo = typeof req.query.returnTo === 'string' ? req.query.returnTo : '/admin';
+
+  // HTML volutamente minimale: serve solo a fare POST /auth/login
+  // e poi lasciare che il frontend prosegua con cookie-session.
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ordini-Lampo — Login</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;max-width:420px;margin:48px auto;padding:0 16px}
+    label{display:block;margin:12px 0 6px}
+    input{width:100%;padding:10px;border:1px solid #bbb;border-radius:8px}
+    button{margin-top:16px;width:100%;padding:10px;border:0;border-radius:8px;cursor:pointer}
+    .muted{opacity:.75;font-size:12px;margin-top:10px}
+  </style>
+</head>
+<body>
+  <h2>Login</h2>
+
+  <form method="post" action="/auth/login">
+    <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}" />
+    <label>Email</label>
+    <input name="email" type="email" autocomplete="email" required />
+
+    <label>Password</label>
+    <input name="password" type="password" autocomplete="current-password" required />
+
+    <button type="submit">Entra</button>
+    <div class="muted">Dopo il login verrai reindirizzato.</div>
+  </form>
+
+  <script>
+    // mini-helper: se il browser invia form-url-encoded va bene.
+  </script>
+</body>
+</html>`);
+});
+
+// escapeHtml super minimale (evita XSS su returnTo)
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'","&#039;");
+}
 
 router.post('/login', rateLimiter.auth, async (req, res) => {
   try {
