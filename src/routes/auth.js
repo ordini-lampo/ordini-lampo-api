@@ -341,6 +341,16 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
       tenant = tenants[0] || null;
     }
 
+    const returnTo =
+      (typeof req.body?.returnTo === 'string' && req.body.returnTo) ||
+      (typeof req.query?.returnTo === 'string' && req.query.returnTo) ||
+      null;
+
+    // Se arriva returnTo (dal form HTML), dopo aver settato i cookie facciamo redirect.
+    if (returnTo) {
+      return res.redirect(302, returnTo);
+    }
+
     return res.json({
       success: true,
       user: {
@@ -351,6 +361,7 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
       tenant,
       csrf_token: csrfToken,
     });
+
 
   } catch (error) {
     if (error instanceof z.ZodError) {
