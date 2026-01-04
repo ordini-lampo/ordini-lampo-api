@@ -14,6 +14,13 @@ const { logger } = require('../lib/logger');
 const { rateLimiter } = require('../middleware/rate-limit');
 
 const router = express.Router();
+// ============================================================
+// GET /auth/csrf  (public)
+// ============================================================
+router.get('/csrf', (req, res) => {
+  const csrfToken = setCsrfCookie(res);
+  return res.json({ csrf_token: csrfToken });
+});
 
 // ============================================================
 // CONFIG
