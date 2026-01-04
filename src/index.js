@@ -144,7 +144,11 @@ app.use(govGuard);
 app.use(authMiddleware);
 
 // 8. CSRF protection (on non-safe methods)
-app.use(csrfProtect);
+app.use((req, res, next) => {
+  // Public CSRF bootstrap endpoint
+  if (req.path === '/auth/csrf' || req.path === '/api/v1/auth/csrf') return next();
+  return csrfProtect(req, res, next);
+});
 
 // ============================================================
 // API ROUTES

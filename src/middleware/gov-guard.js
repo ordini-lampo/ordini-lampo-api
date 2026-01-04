@@ -33,9 +33,9 @@ async function readGovMode() {
 
   const rows = await query(`
     SELECT
-      (SELECT value FROM app.gov_config WHERE key = 'kill_switch') AS kill_switch,
-      (SELECT value FROM app.gov_config WHERE key = 'maintenance_mode') AS maintenance_mode,
-      (SELECT value FROM app.gov_config WHERE key = 'maintenance_message') AS maintenance_message
+      (SELECT value #>> '{}' FROM app.gov_config WHERE key = 'kill_switch') AS kill_switch,
+      (SELECT value #>> '{}' FROM app.gov_config WHERE key = 'maintenance_mode') AS maintenance_mode,
+      (SELECT value #>> '{}' FROM app.gov_config WHERE key = 'maintenance_message') AS maintenance_message
   `);
 
   const value = {
