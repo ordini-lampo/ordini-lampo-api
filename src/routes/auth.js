@@ -16,6 +16,7 @@ const { rateLimiter } = require('../middleware/rate-limit');
 const router = express.Router();
 // ============================================================
 // GET /auth/csrf  (public)
+// Bootstrap CSRF cookie + token for browser clients
 // ============================================================
 router.get('/csrf', (req, res) => {
   const csrfToken = setCsrfCookie(res);
