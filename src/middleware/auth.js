@@ -14,7 +14,10 @@ const SESSION_SAMESITE = process.env.SESSION_SAMESITE || 'lax';
 
 const PUBLIC_ROUTES = [
   /^\/api\/v1\/health$/,
-  /^\/api\/v1\/auth\//,
+  /^\/api\/v1\/auth\/csrf$/,
+  /^\/api\/v1\/auth\/login$/,
+  /^\/api\/v1\/auth\/forgot$/,
+  /^\/api\/v1\/auth\/reset$/,
 ];
 
 function sha256Hex(input) {
