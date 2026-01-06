@@ -48,11 +48,11 @@ app.get('/api/v1/live', (req, res) => {
   return res.status(200).json({
     status: 'ok',
     service: 'ordini-lampo-api',
+    build_probe: 'af952e0',
     git_sha: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GITHUB_SHA || process.env.GIT_SHA || null,
     ts: new Date().toISOString(),
   });
 });
-
 // Trust proxy (Railway)
 app.set('trust proxy', 1);
 
