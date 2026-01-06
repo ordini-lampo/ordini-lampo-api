@@ -48,6 +48,26 @@ function getUA(req) {
 async function authMiddleware(req, res, next) {
   if (PUBLIC_ROUTES.some((rx) => rx.test(req.path))) return next();
 
+  // ============================================================
+  // AUTH BYPASS - FASE DEV (rimuovere prima del pilot)
+  // Permette accesso Admin senza login mentre non ci sono clienti
+  // ============================================================
+  if (process.env.AUTH_BYPASS === 'true') {
+    req.session = {
+      user_id: 'dev-superadmin-001',
+      user_email: 'paolo@ordini-lampo.it',
+      global_role: 'superadmin',
+      tenant_id: null,
+      tenant_role: 'owner',
+      session_id: 'dev-bypass-session'
+    };
+    logger.info({ bypass: true }, 'AUTH_BYPASS attivo - sessione dev iniettata');
+    return next();
+  }
+  // ============================================================
+  // FINE AUTH BYPASS
+  // ============================================================
+
   try {
     const token = req.cookies && req.cookies[SESSION_COOKIE];
     if (!token || typeof token !== 'string') {
