@@ -323,13 +323,13 @@ if (tenant_id) {
   );
   tenantRole = memberships[0]?.role || null;
 }
-await queryWithContext(
-      `INSERT INTO app.sessions
-        (id, user_id, user_email, global_role, tenant_id, tenant_role, csrf_token, created_at, last_seen_at)
-       VALUES
-        ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`,
-      [sessionId, user.id, user.email, user.global_role, tenant_id || null, tenantRole, csrfToken]
-    );
+await query(
+  `INSERT INTO app.sessions
+    (id, user_id, user_email, global_role, tenant_id, tenant_role, csrf_token, created_at, last_seen_at)
+   VALUES
+    ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`,
+  [sessionId, user.id, user.email, user.global_role, tenant_id || null, tenantRole, csrfToken]
+);
 
     // Set session cookie (httpOnly)
     // NOTE: Cookie options should match cors/secure settings (handled elsewhere)
