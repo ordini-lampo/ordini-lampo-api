@@ -310,19 +310,19 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     const sessionId = crypto.randomUUID();
     const csrfToken = crypto.randomBytes(24).toString('hex');
 
-    // tenant role resolution (optional)
-    let tenantRole = null;
-    if (tenant_id) {
-      const memberships = await query(
-        `SELECT role
-         FROM app.tenant_memberships
-         WHERE tenant_id = $1 AND user_id = $2
-         LIMIT 1`,
-        [tenant_id, user.id]
-      );
-      tenantRole = memberships[0]?.role || null;
-    }
-
+// tenant role resolution (optional)
+let tenantRole = null;
+const tenant_id = body?.tenant_id || null;  // Fix P0: definire tenant_id ed evitare crash
+if (tenant_id) {
+  const memberships = await query(
+    `SELECT role
+     FROM app.tenant_memberships
+     WHERE tenant_id = $1 AND user_id = $2
+     LIMIT 1`,
+    [tenant_id, user.id]
+  );
+  tenantRole = memberships[0]?.role || null;
+}
     await queryWithContext(
       req,
       `INSERT INTO app.sessions
