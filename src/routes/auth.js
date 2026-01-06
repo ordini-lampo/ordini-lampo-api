@@ -17,6 +17,7 @@ const router = express.Router();
 
 // ============================================================
 // GET /auth/csrf  (public)
+// Bootstrap CSRF cookie + token for browser clients
 // ============================================================
 router.get('/csrf', (req, res) => {
   const csrfToken = setCsrfCookie(res);
@@ -144,18 +145,75 @@ router.post('/register', rateLimiter.auth, async (req, res) => {
 // ============================================================
 // POST /auth/login (public)
 // ============================================================
+// ============================================================
+// GET /auth/login  (HTML minimal form)
+// ============================================================
+router.get('/login', (req, res) => {
+  const returnTo = typeof req.query.returnTo === 'string' ? req.query.returnTo : '/admin';
+
+  // HTML volutamente minimale: serve solo a fare POST /auth/login
+  // e poi lasciare che il frontend prosegua con cookie-session.
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(`<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ordini-Lampo — Login</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;max-width:420px;margin:48px auto;padding:0 16px}
+    label{display:block;margin:12px 0 6px}
+    input{width:100%;padding:10px;border:1px solid #bbb;border-radius:8px}
+    button{margin-top:16px;width:100%;padding:10px;border:0;border-radius:8px;cursor:pointer}
+    .muted{opacity:.75;font-size:12px;margin-top:10px}
+  </style>
+</head>
+<body>
+  <h2>Login</h2>
+
+  <form method="post" action="/auth/login">
+    <input type="hidden" name="returnTo" value="${escapeHtml(returnTo)}" />
+    <label>Email</label>
+    <input name="email" type="email" autocomplete="email" required />
+
+    <label>Password</label>
+    <input name="password" type="password" autocomplete="current-password" required />
+
+    <button type="submit">Entra</button>
+    <div class="muted">Dopo il login verrai reindirizzato.</div>
+  </form>
+
+  <script>
+    // mini-helper: se il browser invia form-url-encoded va bene.
+  </script>
+</body>
+</html>`);
+});
+
+// escapeHtml super minimale (evita XSS su returnTo)
+function escapeHtml(str) {
+  return String(str)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'","&#039;");
+}
+
 router.post('/login', rateLimiter.auth, async (req, res) => {
   try {
-    const BodySchema = z.object({
-      email: z.string().email().transform((v) => v.trim().toLowerCase()),
-      password: z.string().min(1).max(200),
-      tenant_id: z.string().uuid().optional(),
-    });
+    const body = LoginSchema.parse(req.body);
+    const { email, password } = body;
+    const ip = getIp(req);
+    const ua = getUA(req);
+    console.log("[LOGIN] start", {
+      email_raw: email,
+      email_norm: String(email || "").toLowerCase(),
+      has_password: Boolean(password),
+      ip,
+      ua,
+});
 
-    const parsed = BodySchema.safeParse(req.body || {});
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'INVALID_BODY' });
-    }
 
     const { email, password, tenant_id } = parsed.data;
 
@@ -167,14 +225,31 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
        LIMIT 1`,
       [email]
     );
+    console.log("[LOGIN] user_lookup", {
+      found: users.length > 0,
+      count: users.length,
+    });
+
 
     if (users.length === 0) {
-      // fake delay to reduce timing attacks
-      await bcrypt.compare(password, '$2b$12$CqMrbPS9yX8kq7tGm7jGvOqO9z6mW3g5ZB4Z7QbXq3wqgQ8w6pHf2');
-      return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+      // Timing-safe: hash anyway to prevent timing attacks
+      await bcrypt.hash(password, BCRYPT_COST);
+      console.log("[LOGIN] early_401_reason", "USER_NOT_FOUND");
+      return res.status(401).json({
+        error: 'INVALID_CREDENTIALS',
+        message: 'Email o password non validi',
+      });
     }
 
     const user = users[0];
+      console.log("[LOGIN] user_state", {
+      user_id: user.id,
+      failed_login_attempts: user.failed_login_attempts,
+      locked_until: user.locked_until,
+      global_role: user.global_role,
+      has_password_hash: Boolean(user.password_hash),
+      password_hash_prefix: String(user.password_hash || "").slice(0, 4),    });
+
 
     // Check lock
     if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
@@ -258,6 +333,23 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
+    const rawReturnTo =
+      (typeof req.body?.returnTo === 'string' && req.body.returnTo) ||
+      (typeof req.query?.returnTo === 'string' && req.query.returnTo) ||
+      null;
+
+    // Hardening: allow only internal admin paths
+    let returnTo = null;
+    if (rawReturnTo && rawReturnTo.startsWith('/admin')) {
+      returnTo = rawReturnTo;
+    }
+
+    // Se arriva returnTo valido, redirect sicuro
+    if (returnTo) {
+      return res.redirect(302, returnTo);
+    }
+
+
     return res.json({
       success: true,
       user: {
@@ -269,6 +361,8 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
       tenant_role: tenantRole,
       csrf_token: csrfToken,
     });
+
+
   } catch (error) {
     logger.error({ err: error, requestId: req.requestId }, 'Login error');
     return res.status(500).json({ error: 'INTERNAL_ERROR' });
