@@ -424,3 +424,18 @@ router.get('/me', async (req, res) => {
 });
 
 module.exports = router;
+
+/**
+ * Helpers minimalisti per logging (non-security critical).
+ * Evitano crash in produzione se mancavano import/utility.
+ */
+function getIp(req) {
+  // preferisci X-Forwarded-For (Railway/proxy), fallback su socket
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) return xff.split(',')[0].trim();
+  return req.socket?.remoteAddress || null;
+}
+
+function getUA(req) {
+  return req.headers['user-agent'] || null;
+}
