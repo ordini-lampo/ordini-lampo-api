@@ -382,6 +382,7 @@ if (tenant_id) {
 
 
   } catch (error) {
+    console.error('[LOGIN_FATAL]', req.requestId, error);
     logger.error({ err: error, requestId: req.requestId }, 'Login error');
     return res.status(500).json({ error: 'INTERNAL_ERROR' });
   }
