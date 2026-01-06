@@ -43,6 +43,14 @@ const ALLOWED_ORIGINS = new Set(
 // ============================================================
 
 const app = express();
+// LIVENESS (Railway healthcheck): must be 200 even if DB is down / SAFE_MODE
+app.get('/api/v1/live', (req, res) => {
+  return res.status(200).json({
+    status: 'ok',
+    service: 'ordini-lampo-api',
+    ts: new Date().toISOString(),
+  });
+});
 
 // Trust proxy (Railway)
 app.set('trust proxy', 1);
