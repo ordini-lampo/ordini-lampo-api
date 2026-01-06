@@ -202,7 +202,7 @@ function escapeHtml(str) {
 
 router.post('/login', rateLimiter.auth, async (req, res) => {
   try {
-    const body = LoginSchema.parse(req.body);
+    const body = req.body;
     const { email, password } = body;
     const ip = getIp(req);
     const ua = getUA(req);
