@@ -15,6 +15,11 @@ const { rateLimiter } = require('../middleware/rate-limit');
 
 const router = express.Router();
 
+function sha256Hex(input) {
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+
 // ============================================================
 // GET /auth/csrf  (public)
 // Bootstrap CSRF cookie + token for browser clients
@@ -308,7 +313,8 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     // Create session
     // session cookie auth: store in app.sessions
     const sessionId = crypto.randomUUID();
-    const token_hash = await bcrypt.hash(sessionId, BCRYPT_COST);
+    const token = crypto.randomBytes(32).toString('hex'); // 64 chars
+    const token_hash = sha256Hex(token);
     const csrfToken = crypto.randomBytes(24).toString('hex');
 
 // tenant role resolution (optional)
@@ -341,7 +347,7 @@ await query(
 
     // Set session cookie (httpOnly)
     // NOTE: Cookie options should match cors/secure settings (handled elsewhere)
-    res.cookie('ol_session', sessionId, {
+    res.cookie('ol_session', token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'none',
