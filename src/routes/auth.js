@@ -308,6 +308,7 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     // Create session
     // session cookie auth: store in app.sessions
     const sessionId = crypto.randomUUID();
+    const token_hash = await bcrypt.hash(sessionId, BCRYPT_COST);
     const csrfToken = crypto.randomBytes(24).toString('hex');
 
 // tenant role resolution (optional)
@@ -325,10 +326,17 @@ if (tenant_id) {
 }
 await query(
   `INSERT INTO app.sessions
-    (id, user_id, user_email, global_role, tenant_id, tenant_role, csrf_token, created_at, last_seen_at)
+    (id, user_id, token_hash, ip_address, user_agent, current_tenant_id, created_at, expires_at, last_activity_at)
    VALUES
-    ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`,
-  [sessionId, user.id, user.email, user.global_role, tenant_id || null, tenantRole, csrfToken]
+    ($1, $2, $3, $4, $5, $6, NOW(), NOW() + INTERVAL '30 days', NOW())`,
+  [
+    sessionId,
+    user.id,
+    token_hash,
+    req.ip || null,
+    req.get('user-agent') || null,
+    tenant_id || null
+  ]
 );
 
     // Set session cookie (httpOnly)
