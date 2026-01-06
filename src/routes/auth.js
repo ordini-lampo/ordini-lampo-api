@@ -204,6 +204,17 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
   try {
     const body = req.body;
     const { email, password } = body;
+    const emailNorm = String(email || "").trim().toLowerCase();
+
+    // Guardrail P0: input minimo, mai 500 per payload incompleto
+    if (!emailNorm || !password) {
+      console.log("[LOGIN] early_400_reason INVALID_INPUT", {
+        email_norm: emailNorm,
+        has_password: Boolean(password),
+      });
+      return res.status(400).json({ error: "INVALID_INPUT" });
+    }
+
     const ip = getIp(req);
     const ua = getUA(req);
     console.log("[LOGIN] start", {
@@ -253,6 +264,14 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
     // Check lock
     if (user.locked_until && new Date(user.locked_until).getTime() > Date.now()) {
       return res.status(429).json({ error: 'ACCOUNT_LOCKED' });
+    }
+
+    if (!user || !user.password_hash) {
+      console.log("[LOGIN] early_401_reason USER_NOT_FOUND_OR_NO_PASSWORD", {
+        email_norm: emailNorm,
+        has_password_hash: Boolean(user?.password_hash),
+      });
+      return res.status(401).json({ error: "INVALID_CREDENTIALS" });
     }
 
     const ok = await bcrypt.compare(password, user.password_hash || '');
