@@ -215,7 +215,6 @@ router.post('/login', rateLimiter.auth, async (req, res) => {
 });
 
 
-    const { email, password, tenant_id } = parsed.data;
 
     // Load user
     const users = await query(
