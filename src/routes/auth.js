@@ -323,8 +323,7 @@ if (tenant_id) {
   );
   tenantRole = memberships[0]?.role || null;
 }
-    await queryWithContext(
-      req,
+await queryWithContext(
       `INSERT INTO app.sessions
         (id, user_id, user_email, global_role, tenant_id, tenant_role, csrf_token, created_at, last_seen_at)
        VALUES
