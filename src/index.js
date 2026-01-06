@@ -147,7 +147,13 @@ app.use('/api/v1/auth', authRoutes);
 // ============================================================
 
 // 6. GOV Guard (kill-switch / maintenance) - fail-closed
-app.use(govGuard);
+// GOV GUARD (EXCLUDE AUTH & LIVE)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/v1/auth') || req.path === '/api/v1/live') {
+    return next();
+  }
+  return govGuard(req, res, next);
+});
 
 // 7. Auth middleware (session validation)
 app.use(authMiddleware);
